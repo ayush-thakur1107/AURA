@@ -1,7 +1,10 @@
 opencv-python
-mediapipe
-numpy
+mediapipe>=0.10.14
+pyttsx3
+SpeechRecognition
+pycaw
+psutil
 pyautogui
-torch
-torchvision
-ultralytics
+comtypes
+numpy
+pyaudio

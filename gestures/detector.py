@@ -1,97 +1,138 @@
-# gestures/detector.py
-import cv2
-import mediapipe as mp
-import time
-import numpy as np
+"""
+detector.py
+Hand gesture detector using MediaPipe (optional).
+Exports GestureDetector with process(frame) -> (frame, action, hud).
+If mediapipe is not installed, detector runs in no-op mode and only provides time HUD.
+"""
 
-from utils import take_screenshot_async, speak_async, VolumeController, open_app
+import time
+import logging
+import cv2
+
+logger = logging.getLogger("aura.detector")
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+# try importing mediapipe lazily
+try:
+    import mediapipe as mp  # type: ignore
+    _HAVE_MEDIAPIPE = True
+    logger.info("MediaPipe available: gesture detection enabled.")
+except Exception as e:
+    mp = None  # type: ignore
+    _HAVE_MEDIAPIPE = False
+    logger.info("MediaPipe not available: %s", e)
+
 
 class GestureDetector:
-    def __init__(self):
-        self.hands = mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.6)
-        self.mp_draw = mp.solutions.drawing_utils
-        self.vol = VolumeController()
-        self.last_time = 0
-        self.cooldown = 1.0  # seconds between actions
+    """
+    Detects simple hand gestures using MediaPipe if available.
+    process(frame) -> (frame, action, hud)
+    action in {"thumbs_up", "thumbs_down", "screenshot"} or None
+    hud: dict with keys "time", "sys", "emotion"
+    """
 
-    def fingers_up(self, lm):
-        """Return list [thumb, index, middle, ring, pinky] as 1 (up) or 0 (down)."""
-        # lm: list of landmarks with .x/.y (.z ignored)
-        fingers = []
-        # Thumb: compare tip x to ip x (works when frame is mirrored)
+    def __init__(self, cooldown: float = 1.0):
+        self.enabled = _HAVE_MEDIAPIPE
+        self.cooldown = float(cooldown)
+        self._last_action_time = 0.0
+        self._last_action = None
+        self.hud = {"time": "", "sys": "", "emotion": ""}
+
+        if not self.enabled:
+            return
+
         try:
-            fingers.append(1 if lm[4].x < lm[3].x else 0)
-        except Exception:
-            fingers.append(0)
-        # Other fingers: tip.y < pip.y means up
-        for tip in (8, 12, 16, 20):
-            try:
-                fingers.append(1 if lm[tip].y < lm[tip - 2].y else 0)
-            except Exception:
-                fingers.append(0)
-        return fingers
+            self.mp_hands = mp.solutions.hands
+            self.hands = self.mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=1,
+                min_detection_confidence=0.6,
+                min_tracking_confidence=0.6,
+            )
+            self.mp_draw = mp.solutions.drawing_utils
+        except Exception as e:
+            logger.exception("Failed to initialize MediaPipe Hands: %s", e)
+            self.enabled = False
 
-    def classify(self, lm, frame_h):
-        """Return gesture name or None.
+    def _now_str(self) -> str:
+        return time.strftime("%H:%M:%S")
 
-        Heuristics:
-         - Thumbs up: thumb up (thumb tip clearly above thumb mcp/wrist) and other fingers closed
-         - Thumbs down: thumb down (thumb tip clearly below wrist) and other fingers closed
-         - Peace: index+middle up, others down
-        """
-        fingers = self.fingers_up(lm)
-        # coordinates
-        wrist_y = lm[0].y * frame_h
-        thumb_tip_y = lm[4].y * frame_h
-        thumb_ip_y = lm[3].y * frame_h
-
-        # peace
-        if fingers == [0,1,1,0,0]:
-            return "peace"
-
-        # thumbs up: thumb tip significantly above wrist and other fingers closed
-        if fingers[0] == 1 and fingers[1] == 0 and fingers[2] == 0:
-            if thumb_tip_y < wrist_y - frame_h * 0.06:
-                return "thumbs_up"
-            # side/thumb near wrist but above may be ambiguous -> ignore
-
-        # thumbs down: thumb tip below wrist and fingers closed
-        if fingers[0] == 1 and fingers[1] == 0 and fingers[2] == 0:
-            if thumb_tip_y > wrist_y + frame_h * 0.06:
-                return "thumbs_down"
-
-        return None
+    def _cooldown_ok(self) -> bool:
+        return (time.time() - self._last_action_time) > self.cooldown
 
     def process(self, frame):
-        """Process frame, perform actions, return (frame, action_caption)."""
+        """
+        Process a BGR frame. Returns (frame, action, hud).
+        Keeps frame unchanged if detection unavailable.
+        """
+        self.hud["time"] = self._now_str()
+
+        if not self.enabled or frame is None:
+            return frame, None, self.hud.copy()
+
+        img = frame  # working on the same array (OpenCV drawing is in-place)
+        h, w, _ = img.shape
+        try:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            logger.exception("cvtColor failed: %s", e)
+            return frame, None, self.hud.copy()
+
+        try:
+            res = self.hands.process(rgb)
+        except Exception as e:
+            logger.exception("MediaPipe processing error: %s", e)
+            return frame, None, self.hud.copy()
+
         action = None
-        now = time.time()
-        h, w, _ = frame.shape
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = self.hands.process(img_rgb)
 
-        if res.multi_hand_landmarks:
-            hand = res.multi_hand_landmarks[0]
-            self.mp_draw.draw_landmarks(frame, hand, mp.solutions.hands.HAND_CONNECTIONS)
+        if res and getattr(res, "multi_hand_landmarks", None):
+            try:
+                for hand_lms in res.multi_hand_landmarks:
+                    # draw landmarks on the image
+                    try:
+                        self.mp_draw.draw_landmarks(img, hand_lms, self.mp_hands.HAND_CONNECTIONS)
+                    except Exception:
+                        # drawing is non-critical
+                        pass
 
-            gesture = self.classify(hand.landmark, h)
-            if gesture and (now - self.last_time) > self.cooldown:
-                if gesture == "thumbs_up":
-                    ok = self.vol.change_scalar(0.10)
-                    speak_async("Volume up")
-                    action = "Volume Up"
-                elif gesture == "thumbs_down":
-                    ok = self.vol.change_scalar(-0.10)
-                    speak_async("Volume down")
-                    action = "Volume Down"
-                elif gesture == "peace":
-                    # take screenshot of frame
-                    take_screenshot_async(frame)
-                    action = "Screenshot"
-                self.last_time = now
+                    # convert landmarks to pixel coordinates
+                    landmarks = []
+                    for lm in hand_lms.landmark:
+                        landmarks.append((int(lm.x * w), int(lm.y * h)))
 
-        return frame, action
+                    # basic finger state checks (thumb + four fingers)
+                    fingers = []
+                    try:
+                        # thumb: compare x tip(4) and ip(3) relative to hand (works better with single handedness)
+                        fingers.append(1 if landmarks[4][0] > landmarks[3][0] else 0)
+                        for tip_index in (8, 12, 16, 20):
+                            fingers.append(1 if landmarks[tip_index][1] < landmarks[tip_index - 2][1] else 0)
+                    except Exception:
+                        continue  # skip if any landmark missing
+
+                    wrist_y = landmarks[0][1]
+                    thumb_tip_y = landmarks[4][1]
+                    other_fingers = fingers[1:]
+
+                    # Thumbs up
+                    if thumb_tip_y < wrist_y and other_fingers == [0, 0, 0, 0]:
+                        if self._cooldown_ok():
+                            action = "thumbs_up"
+                    # Thumbs down
+                    elif thumb_tip_y > wrist_y and other_fingers == [0, 0, 0, 0]:
+                        if self._cooldown_ok():
+                            action = "thumbs_down"
+                    # Peace (index + middle open) -> screenshot
+                    elif fingers == [0, 1, 1, 0, 0]:
+                        if self._cooldown_ok():
+                            action = "screenshot"
+
+                    if action:
+                        self._last_action = action
+                        self._last_action_time = time.time()
+                        break
+            except Exception as e:
+                logger.exception("Gesture parsing error: %s", e)
+
+        return img, action, self.hud.copy()
