@@ -1,95 +1,97 @@
-# detector.py
+# gestures/detector.py
 import cv2
 import mediapipe as mp
-import math
 import time
-from utils import save_frame_screenshot, speak_async, VolumeController
+import numpy as np
+
+from utils import take_screenshot_async, speak_async, VolumeController, open_app
 
 class GestureDetector:
-    def __init__(self, cooldown=1.0):
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(static_image_mode=False,
-                                         max_num_hands=1,
-                                         min_detection_confidence=0.6,
-                                         min_tracking_confidence=0.6)
+    def __init__(self):
+        self.hands = mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6)
         self.mp_draw = mp.solutions.drawing_utils
         self.vol = VolumeController()
-        self.cooldown = cooldown
-        self._last_action_time = 0
-        self._last_gesture = None
+        self.last_time = 0
+        self.cooldown = 1.0  # seconds between actions
 
-    # helper to detect which fingers are up (thumb,index,middle,ring,pinky)
-    def _fingers_up(self, lm, w, h):
-        # lm: list of landmarks (.x, .y)
-        out = []
-        # Thumb: compare x of tip and ip (works when frame mirrored)
+    def fingers_up(self, lm):
+        """Return list [thumb, index, middle, ring, pinky] as 1 (up) or 0 (down)."""
+        # lm: list of landmarks with .x/.y (.z ignored)
+        fingers = []
+        # Thumb: compare tip x to ip x (works when frame is mirrored)
         try:
-            tip_x = lm[4].x * w
-            ip_x = lm[3].x * w
-            out.append(1 if tip_x < ip_x else 0)  # 1 if thumb pointing left in mirrored view
+            fingers.append(1 if lm[4].x < lm[3].x else 0)
         except Exception:
-            out.append(0)
-        # Other fingers: tip.y < pip.y means finger up
-        for t in (8, 12, 16, 20):
+            fingers.append(0)
+        # Other fingers: tip.y < pip.y means up
+        for tip in (8, 12, 16, 20):
             try:
-                tip_y = lm[t].y * h
-                pip_y = lm[t - 2].y * h
-                out.append(1 if tip_y < pip_y else 0)
+                fingers.append(1 if lm[tip].y < lm[tip - 2].y else 0)
             except Exception:
-                out.append(0)
-        return out  # [thumb, index, middle, ring, pinky]
+                fingers.append(0)
+        return fingers
 
-    def _classify(self, lm, w, h):
-        """Return 'thumbs_up' / 'thumbs_down' / 'peace' / None"""
-        fingers = self._fingers_up(lm, w, h)
-        wrist_y = lm[0].y * h
-        thumb_tip_y = lm[4].y * h
-        # peace: index+middle up, others down
+    def classify(self, lm, frame_h):
+        """Return gesture name or None.
+
+        Heuristics:
+         - Thumbs up: thumb up (thumb tip clearly above thumb mcp/wrist) and other fingers closed
+         - Thumbs down: thumb down (thumb tip clearly below wrist) and other fingers closed
+         - Peace: index+middle up, others down
+        """
+        fingers = self.fingers_up(lm)
+        # coordinates
+        wrist_y = lm[0].y * frame_h
+        thumb_tip_y = lm[4].y * frame_h
+        thumb_ip_y = lm[3].y * frame_h
+
+        # peace
         if fingers == [0,1,1,0,0]:
             return "peace"
-        # thumbs up: thumb up (fingers closed), tip significantly above wrist
+
+        # thumbs up: thumb tip significantly above wrist and other fingers closed
         if fingers[0] == 1 and fingers[1] == 0 and fingers[2] == 0:
-            if thumb_tip_y < wrist_y - (h * 0.06):
+            if thumb_tip_y < wrist_y - frame_h * 0.06:
                 return "thumbs_up"
-            elif thumb_tip_y > wrist_y + (h * 0.06):
+            # side/thumb near wrist but above may be ambiguous -> ignore
+
+        # thumbs down: thumb tip below wrist and fingers closed
+        if fingers[0] == 1 and fingers[1] == 0 and fingers[2] == 0:
+            if thumb_tip_y > wrist_y + frame_h * 0.06:
                 return "thumbs_down"
+
         return None
 
     def process(self, frame):
-        """
-        Input: BGR frame.
-        Output: (frame_with_overlays, action_string_or_None)
-        action_string examples: "Volume Up", "Volume Down", "Screenshot"
-        """
+        """Process frame, perform actions, return (frame, action_caption)."""
         action = None
         now = time.time()
-
         h, w, _ = frame.shape
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = self.hands.process(img_rgb)
 
         if res.multi_hand_landmarks:
             hand = res.multi_hand_landmarks[0]
-            # draw landmarks
-            self.mp_draw.draw_landmarks(frame, hand, self.mp_hands.HAND_CONNECTIONS)
-            gesture = self._classify(hand.landmark, w, h)
+            self.mp_draw.draw_landmarks(frame, hand, mp.solutions.hands.HAND_CONNECTIONS)
 
-            # enforce cooldown and avoid repeats
-            if gesture and (now - self._last_action_time > self.cooldown or gesture != self._last_gesture):
+            gesture = self.classify(hand.landmark, h)
+            if gesture and (now - self.last_time) > self.cooldown:
                 if gesture == "thumbs_up":
-                    ok = self.vol.change(0.10)
-                    action = "Volume Up"
+                    ok = self.vol.change_scalar(0.10)
                     speak_async("Volume up")
+                    action = "Volume Up"
                 elif gesture == "thumbs_down":
-                    ok = self.vol.change(-0.10)
-                    action = "Volume Down"
+                    ok = self.vol.change_scalar(-0.10)
                     speak_async("Volume down")
+                    action = "Volume Down"
                 elif gesture == "peace":
-                    # take screenshot asynchronously (save_frame_screenshot expects a frame image)
-                    save_frame_screenshot(frame, folder="screenshots")
+                    # take screenshot of frame
+                    take_screenshot_async(frame)
                     action = "Screenshot"
-                    # TTS done by save_frame_screenshot
-                self._last_action_time = now
-                self._last_gesture = gesture
+                self.last_time = now
 
         return frame, action

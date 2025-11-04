@@ -1,43 +1,54 @@
-# utilities.py
 import os
 import threading
 import time
 import webbrowser
-import datetime
+import subprocess
+import pyautogui
 
-# TTS (pyttsx3) - init per thread to avoid blocking issues across calls
+# TTS
+try:
+    import pyttsx3
+    HAVE_TTS = True
+except Exception:
+    HAVE_TTS = False
+
+if HAVE_TTS:
+    _tts_engine = pyttsx3.init()
+    _tts_engine.setProperty("rate", 170)
+
+def speak(text: str):
+    """Speak synchronously (blocking)."""
+    if not HAVE_TTS:
+        print("[TTS missing] " + text)
+        return
+    try:
+        _tts_engine.say(text)
+        _tts_engine.runAndWait()
+    except Exception as e:
+        print("[TTS error]", e)
+
 def speak_async(text: str):
-    """Say `text` asynchronously (non-blocking)."""
-    def _worker(txt):
-        try:
-            import pyttsx3
-            engine = pyttsx3.init()
-            engine.setProperty("rate", 165)
-            engine.say(txt)
-            engine.runAndWait()
-            engine.stop()
-        except Exception as e:
-            print("[TTS error]", e)
-    threading.Thread(target=_worker, args=(text,), daemon=True).start()
+    """Speak without blocking main thread."""
+    threading.Thread(target=speak, args=(text,), daemon=True).start()
 
-# Screenshot (save a provided frame)
-def save_frame_screenshot(frame, folder="screenshots"):
-    """Save OpenCV frame to disk (non-blocking)."""
-    def _save(img, f):
-        try:
-            import cv2
-            os.makedirs(f, exist_ok=True)
-            name = datetime.datetime.now().strftime("screenshot_%Y%m%d_%H%M%S.png")
-            path = os.path.join(f, name)
-            cv2.imwrite(path, img)
-            print("[AURA] Screenshot saved:", path)
-            speak_async("Screenshot saved")
-        except Exception as e:
-            print("[Screenshot error]", e)
-            speak_async("Failed to save screenshot")
-    threading.Thread(target=_save, args=(frame.copy(), folder), daemon=True).start()
+# Screenshot
+def _save_frame_image(frame, folder="screenshots"):
+    os.makedirs(folder, exist_ok=True)
+    filename = os.path.join(folder, f"screenshot_{int(time.time())}.png")
+    try:
+        import cv2
+        cv2.imwrite(filename, frame)
+        speak_async("Screenshot captured")
+        print("[AURA] Screenshot saved:", filename)
+    except Exception as e:
+        print("[AURA] Screenshot save error:", e)
+        speak_async("Failed to save screenshot")
 
-# Open common apps / URLs
+def take_screenshot_async(frame):
+    """Save the passed frame asynchronously (avoid pyautogui freeze)."""
+    threading.Thread(target=_save_frame_image, args=(frame.copy(),), daemon=True).start()
+
+# App launcher
 def open_app(name: str):
     name = name.lower()
     try:
@@ -46,93 +57,63 @@ def open_app(name: str):
         elif "google" in name:
             webbrowser.open("https://www.google.com")
         elif "spotify" in name:
-            os.system("start spotify")
+            subprocess.Popen("start spotify", shell=True)
         elif "vscode" in name or "code" in name:
-            os.system("code")
+            subprocess.Popen("code", shell=True)
         elif "notepad" in name:
-            os.system("notepad")
+            subprocess.Popen("notepad", shell=True)
         elif "calculator" in name:
-            os.system("calc")
+            subprocess.Popen("calc", shell=True)
         else:
-            speak_async(f"I don't have a launcher for {name}")
+            speak_async(f"Can't open {name}")
             return
         speak_async(f"Opening {name}")
     except Exception as e:
-        print("[open_app error]", e)
+        print("[open_app] error:", e)
         speak_async(f"Failed to open {name}")
 
-# Volume controller (pycaw primary; pyautogui fallback)
+# Volume Controller (pycaw primary, session fallback)
+try:
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    HAVE_PYCAW = True
+except Exception:
+    HAVE_PYCAW = False
+
 class VolumeController:
     def __init__(self):
-        self._use_pycaw = False
-        try:
-            from ctypes import cast, POINTER
-            from comtypes import CLSCTX_ALL
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-            devices = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            self._vol = cast(interface, POINTER(IAudioEndpointVolume))
-            self._use_pycaw = True
-        except Exception as e:
-            print("[VolumeController] pycaw init failed, falling back to keypress:", e)
-            self._vol = None
-            # ensure pyautogui available
+        self.volume = None
+        if HAVE_PYCAW:
             try:
-                import pyautogui
-                self._pyautogui = pyautogui
-            except Exception:
-                self._pyautogui = None
+                devices = AudioUtilities.GetSpeakers()
+                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                self.volume = cast(interface, POINTER(IAudioEndpointVolume))
+            except Exception as e:
+                print("[VolumeController] pycaw init failed:", e)
+                self.volume = None
 
-    def change(self, delta_scalar: float):
-        """
-        Change volume by scalar delta (-1.0 .. +1.0).
-        delta_scalar ~ +0.1 increases ~10%, -0.1 decreases.
-        """
+    def change_scalar(self, delta: float):
+        """delta is relative, e.g. +0.1 or -0.1"""
         try:
-            if self._use_pycaw and self._vol:
-                cur = self._vol.GetMasterVolumeLevelScalar()
-                new = min(max(cur + delta_scalar, 0.0), 1.0)
-                self._vol.SetMasterVolumeLevelScalar(new, None)
-                print(f"[Volume] set {new:.2f}")
+            if self.volume is not None:
+                cur = self.volume.GetMasterVolumeLevelScalar()
+                new = min(max(cur + delta, 0.0), 1.0)
+                self.volume.SetMasterVolumeLevelScalar(new, None)
                 return True
             else:
-                # fallback: press OS volume keys multiple times depending on delta
-                if self._pyautogui:
-                    steps = int(abs(delta_scalar) * 10) or 1
-                    key = "volumeup" if delta_scalar > 0 else "volumedown"
-                    for _ in range(steps):
-                        self._pyautogui.press(key)
-                    return True
+                # session-level fallback
+                sessions = AudioUtilities.GetAllSessions()
+                for s in sessions:
+                    try:
+                        vol = s.SimpleAudioVolume
+                        if vol is not None:
+                            cur = vol.GetMasterVolume()
+                            new = min(max(cur + delta, 0.0), 1.0)
+                            vol.SetMasterVolume(new, None)
+                    except Exception:
+                        pass
+                return True
         except Exception as e:
-            print("[Volume change error]", e)
-        return False
-
-# Voice command processor (simple)
-def process_voice_command(cmd: str):
-    """Basic mapping of voice commands to utilities."""
-    if not cmd:
-        return
-    c = cmd.lower()
-    print("[Voice Command]", c)
-
-    # open apps
-    if "youtube" in c:
-        open_app("youtube")
-    elif "google" in c:
-        open_app("google")
-    elif "spotify" in c:
-        open_app("spotify")
-    elif "vscode" in c or "code" in c:
-        open_app("vscode")
-    elif "notepad" in c:
-        open_app("notepad")
-    elif "screenshot" in c or "capture" in c:
-        # main loop will call screenshot — here we only say intent
-        speak_async("Say peace sign or I will capture.")
-    elif "time" in c:
-        speak_async("The time is " + time.strftime("%I:%M %p"))
-    elif "exit" in c or "quit" in c or "stop" in c:
-        speak_async("Shutting down Aura")
-        # caller should handle shutdown if desired
-    else:
-        speak_async("I heard " + cmd)
+            print("[VolumeController] change error:", e)
+            return False
