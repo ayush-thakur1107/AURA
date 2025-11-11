@@ -1,13 +1,4 @@
-"""
-utils.py
-Utilities for AURA assistant:
-- Threaded TTS queue (pyttsx3 fallback to print)
-- Screenshot saver (async)
-- VolumeController (pycaw -> pyautogui -> noop)
-- App opener (OS-aware)
-- System info, quotes, reminders
-- Voice listener starter (SpeechRecognition -> no-op)
-"""
+
 
 from typing import Optional
 import threading
@@ -104,13 +95,6 @@ def save_frame_screenshot(frame, folder: str = "screenshots") -> None:
 
 # ----------------- Volume control -----------------
 class VolumeController:
-    """
-    Attempts to control system volume:
-      1) Windows: try pycaw (preferred)
-      2) Fallback: pyautogui key presses (volumeup / volumedown)
-      3) Else: no-op but returns False
-    change(delta: float) where delta ~ 0.1 adjusts by ~10%.
-    """
 
     def __init__(self):
         self._use_pycaw = False
